@@ -3,58 +3,149 @@ import sqlite3
 from flask import Flask, jsonify, request, render_template_string
 
 DB_PATH = "leiloes_sc.db"
+DATABASE_URL = os.environ.get("DATABASE_URL")
 app = Flask(__name__)
 
+# Detecta se usa PostgreSQL ou SQLite
+USE_POSTGRES = DATABASE_URL is not None
+
+if USE_POSTGRES:
+    import psycopg2
+    import psycopg2.extras
+
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if USE_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL)
+        return conn
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+def init_db():
+    if USE_POSTGRES:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS imoveis (
+                id               SERIAL PRIMARY KEY,
+                numero_processo  TEXT    NOT NULL UNIQUE,
+                descricao        TEXT,
+                valor_avaliacao  TEXT,
+                cidade           TEXT,
+                fonte            TEXT,
+                url_edital       TEXT,
+                criado_em        TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+    else:
+        conn = get_db()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS imoveis (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                numero_processo  TEXT    NOT NULL UNIQUE,
+                descricao        TEXT,
+                valor_avaliacao  TEXT,
+                cidade           TEXT,
+                fonte            TEXT,
+                url_edital       TEXT,
+                criado_em        TEXT DEFAULT (datetime('now','localtime'))
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+def query_db(query, params=()):
+    if USE_POSTGRES:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [dict(r) for r in rows]
+    else:
+        conn = get_db()
+        rows = conn.execute(query, params).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+def query_one(query, params=()):
+    if USE_POSTGRES:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(query, params)
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return row[0] if row else 0
+    else:
+        conn = get_db()
+        row = conn.execute(query, params).fetchone()
+        conn.close()
+        return row[0] if row else 0
 
 @app.route("/api/imoveis")
 def api_imoveis():
     busca  = request.args.get("q", "").strip()
     fonte  = request.args.get("fonte", "").strip()
     cidade = request.args.get("cidade", "").strip()
-    conn = get_db()
-    query = "SELECT * FROM imoveis WHERE 1=1"
-    params = []
-    if busca:
-        query += " AND (descricao LIKE ? OR numero_processo LIKE ? OR cidade LIKE ?)"
-        like = f"%{busca}%"
-        params += [like, like, like]
-    if fonte:
-        query += " AND fonte = ?"
-        params.append(fonte)
-    if cidade:
-        query += " AND cidade LIKE ?"
-        params.append(f"%{cidade}%")
-    query += " ORDER BY criado_em DESC"
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
-    return jsonify([dict(r) for r in rows])
+
+    if USE_POSTGRES:
+        query = "SELECT * FROM imoveis WHERE 1=1"
+        params = []
+        if busca:
+            query += " AND (descricao ILIKE %s OR numero_processo ILIKE %s OR cidade ILIKE %s)"
+            like = f"%{busca}%"
+            params += [like, like, like]
+        if fonte:
+            query += " AND fonte = %s"
+            params.append(fonte)
+        if cidade:
+            query += " AND cidade ILIKE %s"
+            params.append(f"%{cidade}%")
+        query += " ORDER BY criado_em DESC"
+    else:
+        query = "SELECT * FROM imoveis WHERE 1=1"
+        params = []
+        if busca:
+            query += " AND (descricao LIKE ? OR numero_processo LIKE ? OR cidade LIKE ?)"
+            like = f"%{busca}%"
+            params += [like, like, like]
+        if fonte:
+            query += " AND fonte = ?"
+            params.append(fonte)
+        if cidade:
+            query += " AND cidade LIKE ?"
+            params.append(f"%{cidade}%")
+        query += " ORDER BY criado_em DESC"
+
+    rows = query_db(query, params)
+    return jsonify(rows)
 
 @app.route("/api/stats")
 def api_stats():
-    conn = get_db()
-    total  = conn.execute("SELECT COUNT(*) FROM imoveis").fetchone()[0]
-    fontes = conn.execute("SELECT fonte, COUNT(*) as n FROM imoveis GROUP BY fonte").fetchall()
-    hoje   = conn.execute("SELECT COUNT(*) FROM imoveis WHERE date(criado_em) = date('now','localtime')").fetchone()[0]
-    conn.close()
-    return jsonify({"total": total, "hoje": hoje, "fontes": [dict(r) for r in fontes]})
+    total = query_one("SELECT COUNT(*) FROM imoveis")
+    if USE_POSTGRES:
+        hoje = query_one("SELECT COUNT(*) FROM imoveis WHERE criado_em::date = CURRENT_DATE")
+        fontes = query_db("SELECT fonte, COUNT(*) as n FROM imoveis GROUP BY fonte")
+    else:
+        hoje = query_one("SELECT COUNT(*) FROM imoveis WHERE date(criado_em) = date('now','localtime')")
+        fontes = query_db("SELECT fonte, COUNT(*) as n FROM imoveis GROUP BY fonte")
+    return jsonify({"total": total, "hoje": hoje, "fontes": fontes})
 
 @app.route("/api/fontes")
 def api_fontes():
-    conn = get_db()
-    rows = conn.execute("SELECT DISTINCT fonte FROM imoveis ORDER BY fonte").fetchall()
-    conn.close()
-    return jsonify([r[0] for r in rows])
+    rows = query_db("SELECT DISTINCT fonte FROM imoveis ORDER BY fonte")
+    return jsonify([r["fonte"] for r in rows])
 
 @app.route("/api/cidades")
 def api_cidades():
-    conn = get_db()
-    rows = conn.execute("SELECT DISTINCT cidade FROM imoveis ORDER BY cidade").fetchall()
-    conn.close()
-    return jsonify([r[0] for r in rows])
+    rows = query_db("SELECT DISTINCT cidade FROM imoveis ORDER BY cidade")
+    return jsonify([r["cidade"] for r in rows])
 
 HTML = """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -64,10 +155,7 @@ HTML = """<!DOCTYPE html>
 <title>Leiloes Judiciais SC</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,600;1,9..144,300&display=swap" rel="stylesheet">
 <style>
-  :root {
-    --bg:#0d0f14;--surface:#13161e;--border:#1f2430;--accent:#c8a96e;
-    --accent2:#5b8dd9;--success:#4caf82;--text:#e8e2d6;--muted:#6b7080;--radius:6px;
-  }
+  :root{--bg:#0d0f14;--surface:#13161e;--border:#1f2430;--accent:#c8a96e;--accent2:#5b8dd9;--success:#4caf82;--text:#e8e2d6;--muted:#6b7080;--radius:6px}
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
   body{background:var(--bg);color:var(--text);font-family:'DM Mono',monospace;font-size:13px;min-height:100vh}
   header{background:var(--surface);border-bottom:1px solid var(--border);padding:0 32px;height:60px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
@@ -86,26 +174,24 @@ HTML = """<!DOCTYPE html>
   input[type="text"]{width:100%;padding-left:36px}
   input[type="text"]:focus,select:focus{border-color:var(--accent)}
   select{cursor:pointer;min-width:160px}
-  .btn-refresh{background:var(--accent);color:#0d0f14;border:none;border-radius:var(--radius);padding:9px 16px;font-family:'DM Mono',monospace;font-size:12px;font-weight:500;cursor:pointer;white-space:nowrap;transition:opacity .2s;display:flex;align-items:center;gap:6px}
+  .btn-refresh{background:var(--accent);color:#0d0f14;border:none;border-radius:var(--radius);padding:9px 16px;font-family:'DM Mono',monospace;font-size:12px;font-weight:500;cursor:pointer;white-space:nowrap;transition:opacity .2s}
   .btn-refresh:hover{opacity:.85}
   .table-wrap{overflow-x:auto;padding:0 32px 40px}
   table{width:100%;border-collapse:collapse;margin-top:16px}
-  thead th{text-align:left;padding:10px 14px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid var(--border);white-space:nowrap;cursor:pointer;user-select:none}
+  thead th{text-align:left;padding:10px 14px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid var(--border);white-space:nowrap;cursor:pointer}
   thead th:hover{color:var(--accent)}
   tbody tr{border-bottom:1px solid var(--border);transition:background .15s;animation:fadeIn .3s ease both}
   tbody tr:hover{background:var(--surface)}
   @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
   td{padding:12px 14px;vertical-align:middle}
-  .processo{font-family:'DM Mono',monospace;color:var(--accent2);font-size:12px;white-space:nowrap}
-  .descricao{max-width:300px;color:var(--text);line-height:1.4}
+  .processo{color:var(--accent2);font-size:12px;white-space:nowrap}
+  .descricao{max-width:300px;line-height:1.4}
   .valor{color:var(--success);white-space:nowrap}
-  .fonte-badge{display:inline-block;padding:3px 8px;border-radius:3px;font-size:10px;text-transform:uppercase;letter-spacing:.5px;white-space:nowrap;background:#1a1f2e;border:1px solid var(--border);color:var(--muted)}
+  .fonte-badge{display:inline-block;padding:3px 8px;border-radius:3px;font-size:10px;text-transform:uppercase;background:#1a1f2e;border:1px solid var(--border);color:var(--muted)}
   .fonte-badge.tjsc{border-color:#3a5a9a;color:#7aaaf0}
   .fonte-badge.jfsc{border-color:#3a7a5a;color:#6acfa0}
-  .fonte-badge.mega{border-color:#7a3a3a;color:#e07070}
-  .fonte-badge.leilo{border-color:#7a6a3a;color:#d4a84b}
   .data{color:var(--muted);font-size:11px;white-space:nowrap}
-  .link-edital{color:var(--accent);text-decoration:none;font-size:11px;opacity:.8;transition:opacity .2s}
+  .link-edital{color:var(--accent);text-decoration:none;font-size:11px;opacity:.8}
   .link-edital:hover{opacity:1}
   .empty{text-align:center;padding:60px 20px;color:var(--muted)}
   .loading{text-align:center;padding:40px;color:var(--muted)}
@@ -135,7 +221,7 @@ HTML = """<!DOCTYPE html>
   <button class="btn-refresh" onclick="carregar()">Atualizar</button>
 </div>
 <div class="table-wrap">
-  <div id="loading" class="loading"><span class="spinner"></span> Carregando imoveis...</div>
+  <div id="loading" class="loading"><span class="spinner"></span> Carregando...</div>
   <table id="tabela" style="display:none">
     <thead><tr>
       <th data-col="numero_processo">N Processo</th>
@@ -152,8 +238,7 @@ HTML = """<!DOCTYPE html>
 </div>
 <footer>Painel Leiloes Judiciais SC</footer>
 <script>
-let dados=[];
-let sortCol='criado_em',sortDir='desc';
+let dados=[],sortCol='criado_em',sortDir='desc';
 async function carregarFiltros(){
   const[fontes,cidades]=await Promise.all([fetch('/api/fontes').then(r=>r.json()),fetch('/api/cidades').then(r=>r.json())]);
   const sf=document.getElementById('filtro-fonte');
@@ -178,8 +263,7 @@ async function carregar(){
   const params=new URLSearchParams();
   if(q)params.set('q',q);if(fonte)params.set('fonte',fonte);if(cidade)params.set('cidade',cidade);
   dados=await fetch('/api/imoveis?'+params).then(r=>r.json());
-  await carregarStats();
-  renderizar();
+  await carregarStats();renderizar();
 }
 function renderizar(){
   const sorted=[...dados].sort((a,b)=>{
@@ -194,18 +278,19 @@ function renderizar(){
   sorted.forEach((im,i)=>{
     const tr=document.createElement('tr');
     tr.style.animationDelay=Math.min(i*20,300)+'ms';
-    const fc={'TJSC':'tjsc','JFSC':'jfsc','megaleiloes.com.br':'mega','leiloesjudiciais.com.br':'leilo'}[im.fonte]||'';
+    const fc={'TJSC':'tjsc','JFSC':'jfsc'}[im.fonte]||'';
     const data=im.criado_em?new Date(im.criado_em).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}):'';
     tr.innerHTML=`<td class="processo">${im.numero_processo}</td><td class="descricao">${im.descricao||''}</td><td class="valor">${im.valor_avaliacao||''}</td><td>${im.cidade||''}</td><td><span class="fonte-badge ${fc}">${im.fonte}</span></td><td class="data">${data}</td><td>${im.url_edital?`<a class="link-edital" href="${im.url_edital}" target="_blank">abrir</a>`:''}</td>`;
     tbody.appendChild(tr);
   });
-}
-document.querySelectorAll('thead th[data-col]').forEach(th=>{
-  th.addEventListener('click',()=>{
-    if(sortCol===th.dataset.col){sortDir=sortDir==='asc'?'desc':'asc';}else{sortCol=th.dataset.col;sortDir='desc';}
-    renderizar();
+  document.querySelectorAll('thead th[data-col]').forEach(th=>{
+    th.style.cursor='pointer';
+    th.onclick=()=>{
+      if(sortCol===th.dataset.col){sortDir=sortDir==='asc'?'desc':'asc';}else{sortCol=th.dataset.col;sortDir='desc';}
+      renderizar();
+    };
   });
-});
+}
 let timer;
 document.getElementById('busca').addEventListener('input',()=>{clearTimeout(timer);timer=setTimeout(carregar,350)});
 document.getElementById('filtro-fonte').addEventListener('change',carregar);
@@ -219,23 +304,7 @@ carregarFiltros().then(carregar);
 def index():
     return render_template_string(HTML)
 
-def garantir_banco():
-    if not os.path.exists(DB_PATH):
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS imoveis (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                numero_processo TEXT NOT NULL,
-                descricao TEXT, valor_avaliacao TEXT, cidade TEXT,
-                fonte TEXT, url_edital TEXT,
-                criado_em TEXT DEFAULT (datetime('now','localtime')),
-                UNIQUE(numero_processo)
-            )
-        """)
-        conn.commit()
-        conn.close()
-
 if __name__ == "__main__":
-    garantir_banco()
+    init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
